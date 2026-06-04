@@ -8,47 +8,37 @@ const {
     TextInputStyle
 } = require('discord.js');
 
+
+
+
 const { db, ensureUser, getUser } = require('./db');
+const {
+    DAYS_PER_SEASON,
+    seasons,
+    cropItems,
+    shopItems,
+    getSeasonIndex,
+    getCropName
+} = require('./farmData');
+const { recordItemStat } = require('./farmStats');
+
+
+const {
+    ensureWeeklyQuest,
+    getWeeklyQuest,
+    addWeeklyQuestProgress,
+    createWeeklyQuestText,
+    createWeeklyQuestRows,
+    claimWeeklyQuestReward
+} = require('./farmQuest');
+
+
+
 
 const GAME_MINUTES_PER_REAL_SECOND = 10;
 const MINUTES_PER_DAY = 24 * 60;
-const DAYS_PER_SEASON = 28;
 
-const seasons = ['봄', '여름', '가을', '겨울'];
-// 작물 관련 공통 데이터
-const cropItems = {
-    wheat: {
-        name: '밀',
-        emoji: '🌾',
-        seedPrice: 10
-    },
-    potato: {
-        name: '감자',
-        emoji: '🥔',
-        seedPrice: 20
-    },
-    carrot: {
-        name: '당근',
-        emoji: '🥕',
-        seedPrice: 25
-    },
-    strawberry: {
-        name: '딸기',
-        emoji: '🍓',
-        seedPrice: 40
-    }
-};
 
-const shopItems = Object.fromEntries(
-    Object.entries(cropItems).map(([cropId, crop]) => [
-        `${cropId}_seed`,
-        {
-            name: `${crop.name} 씨앗`,
-            emoji: crop.emoji,
-            price: crop.seedPrice
-        }
-    ])
-);
 
 let farmUi = {
     farmPanelMessage: null,
@@ -103,6 +93,7 @@ db.prepare(`
         PRIMARY KEY (discord_user_id, item_id)
     )
 `).run();
+
 
 
 // farms 테이블에 특정 컬럼이 있는지 확인한다.
@@ -407,8 +398,6 @@ function removeInventoryItem(userId, itemId, quantity) {
 
 
 
-
-
 function addInventoryItem(userId, itemId, quantity) {
     db.prepare(`
         INSERT INTO farm_inventory (discord_user_id, item_id, quantity)
@@ -417,8 +406,6 @@ function addInventoryItem(userId, itemId, quantity) {
         DO UPDATE SET quantity = quantity + excluded.quantity
     `).run(userId, itemId, quantity);
 }
-
-
 
 
 
@@ -492,10 +479,7 @@ function saveFarmTime(userId, year, season, day, timeMinutes) {
     `).run(year, season, day, timeMinutes, getCurrentTimestamp(), userId);
 }
 
-function getSeasonIndex(season) {
-    const index = seasons.indexOf(season);
-    return index === -1 ? 0 : index;
-}
+
 
 function advanceDate(year,season, day, extraDays) {
     let newYear = year;
@@ -821,6 +805,15 @@ function createFarmControlRow(farm) {
     );
 }
 
+function createFarmQuestRow() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('farm_weekly_quest')
+            .setLabel('주간 퀘스트')
+            .setStyle(ButtonStyle.Primary)
+    );
+}
+
 
 async function sendFarmPanel(channel, user) {
     stopFarmRealtime();// 매시지 패널을 생성할때마다 타이머를 끔 -> 아래에 타이머를 생성하는 코드가 있음
@@ -850,7 +843,8 @@ async function sendFarmPanel(channel, user) {
         embeds: [createFarmEmbed(user, farm, userData, inventory)],
         components: [
             ...createPlotRows(farm),
-            createFarmControlRow(farm)
+            createFarmControlRow(farm),
+            createFarmQuestRow()
         ]
     });
 
@@ -887,7 +881,8 @@ async function refreshFarmPanelRealtime() {
             embeds: [createFarmEmbed(user, farm, userData, inventory)],
             components: [
                 ...createPlotRows(farm),
-                createFarmControlRow(farm)
+                createFarmControlRow(farm),
+                createFarmQuestRow()
             ]
         });
         } catch (error) {
@@ -948,7 +943,8 @@ async function refreshFarmPanel(interaction) {
         embeds: [createFarmEmbed(interaction.user, farm, userData, inventory)],
         components: [
             ...createPlotRows(farm),
-            createFarmControlRow(farm)
+            createFarmControlRow(farm),
+            createFarmQuestRow()
         ]
     });
 }
@@ -1052,6 +1048,10 @@ function plantSeedRange(userId, centerIndex) {
 
     // 씨앗은 딱 1개만 소비한다.
     removeInventoryItem(userId, farm.selected_item, 1);
+    //심어진 밭수 
+    recordItemStat(userId, farm.selected_item, 'planted', emptyIndexes.length);
+    //진행도 증가
+    addWeeklyQuestProgress(userId, farm, 'plant', farm.selected_item, emptyIndexes.length);
 
     return {
         message: `${emptyIndexes.length}칸에 씨앗을 심었습니다. 씨앗 1개를 사용했습니다.`
@@ -1059,28 +1059,44 @@ function plantSeedRange(userId, centerIndex) {
 }
 
 ////---- 성장관련 함수와 변수들----
-const CROP_GROWING_MINUTES = 60;
-const CROP_READY_MINUTES = 180;
 
+
+// 현재 농장 시간을 게임 시작 후 총 몇 분이 지났는지로 계산한다.
 function getCurrentFarmMinutes(farm) {
-    const seasonIndex = getSeasonIndex(farm.season); //현재 계절이 몇번째 계절 인지를 구한다 봄=0, 여름=1, 가을=2, 겨울=3
+    const seasonIndex = getSeasonIndex(farm.season); // 봄=0, 여름=1, 가을=2, 겨울=3
 
     const totalDays =
-        (farm.year - 1) * DAYS_PER_SEASON * seasons.length +//이전 년도들이 가진 총 날짜의수 1년차면 ->0일일걸, 2년차면 ->112일??
-        seasonIndex * DAYS_PER_SEASON + // 한연도내에서 지나간 날짜
-        (farm.day - 1);//현재 계절에서 지나간 날
+        (farm.year - 1) * DAYS_PER_SEASON * seasons.length +
+        seasonIndex * DAYS_PER_SEASON +
+        (farm.day - 1);
 
-    return totalDays * MINUTES_PER_DAY + farm.time_minutes;// totalDays * MINUTES_PER_DAY날짜를 분으로 바꾸는,게임시작후 몇분 지났는가
+    return totalDays * MINUTES_PER_DAY + farm.time_minutes;
 }
 
+// 밭 상태 문자열에서 작물 ID만 뽑아낸다.
+// 예: wheat_seed -> wheat, potato_growing -> potato, strawberry_ready -> strawberry
+function getCropIdFromPlot(plot) {
+    return plot
+        .replace('_seed', '')
+        .replace('_growing', '')
+        .replace('_ready', '');
+}
+
+// 씨앗 상태를 성장 중 상태로 바꾼다.
+// 예: wheat_seed -> wheat_growing
 function getGrowingState(seedItemId) {
     return seedItemId.replace('_seed', '_growing');
 }
 
-function getReadyState(seedItemId) {
-    return seedItemId.replace('_seed', '_ready');
+// 작물 ID를 수확 가능 상태로 바꾼다.
+// 예: wheat -> wheat_ready
+function getReadyStateFromCropId(cropId) {
+    return `${cropId}_ready`;
 }
-//작물 성장 함수)
+
+// 작물 성장 상태를 갱신한다.
+// 이제 모든 작물이 같은 성장 시간을 쓰지 않고,
+// cropItems 안에 적힌 growingMinutes, readyMinutes를 사용한다.
 function growCrops(userId) {
     const farm = getFarm(userId);
 
@@ -1094,18 +1110,29 @@ function growCrops(userId) {
         const plot = plots[i];
         const plantedAt = plantedTimes[i];
 
+        // 아무것도 심지 않은 칸은 건너뛴다.
         if (plantedAt === -1) continue;
+
+        // 빈 밭은 건너뛴다.
+        if (plot === 'empty') continue;
+
+        const cropId = getCropIdFromPlot(plot);
+        const crop = cropItems[cropId];
+
+        // cropItems에 없는 작물이면 처리하지 않는다.
+        if (!crop) continue;
 
         const age = currentMinutes - plantedAt;
 
-        if (plot.endsWith('_seed') && age >= CROP_GROWING_MINUTES) {
-            plots[i] = getGrowingState(plot);
+        // 씨앗 상태에서 작물별 growingMinutes가 지나면 growing 상태가 된다.
+        if (plot.endsWith('_seed') && age >= crop.growingMinutes) {
+            plots[i] = `${cropId}_growing`;
             changed = true;
         }
 
-        if (plot.endsWith('_growing') && age >= CROP_READY_MINUTES) {
-            const seedName = plot.replace('_growing', '_seed');
-            plots[i] = getReadyState(seedName);
+        // growing 상태에서 작물별 readyMinutes가 지나면 ready 상태가 된다.
+        if (plot.endsWith('_growing') && age >= crop.readyMinutes) {
+            plots[i] = getReadyStateFromCropId(cropId);
             changed = true;
         }
     }
@@ -1134,15 +1161,20 @@ function harvestReadyCrops(userId) {
         // 수확 가능 상태가 아니면 건너뛴다.
         if (!plot.endsWith('_ready')) continue;
 
-        // wheat_ready -> wheat
-        // potato_ready -> potato
-        const cropItemId = plot.replace('_ready', '');
+        const cropId = plot.replace('_ready', '');
+        const crop = cropItems[cropId];
 
-        harvestCounts[cropItemId] = (harvestCounts[cropItemId] || 0) + 1;
+        if (!crop) continue;
 
-        // 수확한 밭은 비운다.
-        plots[i] = 'empty';
-        plantedTimes[i] = -1;
+        harvestCounts[cropId] = (harvestCounts[cropId] || 0) + 1;
+
+        if (crop.regrowable) {
+            plots[i] = `${cropId}_growing`;
+            plantedTimes[i] = currentMinutes;// 연작 작물일시 growing 상태로 돌림
+        } else {
+            plots[i] = 'empty';
+            plantedTimes[i] = -1;
+        }
     }
 
     const harvestedItems = Object.entries(harvestCounts);
@@ -1156,8 +1188,9 @@ function harvestReadyCrops(userId) {
 
     harvestedItems.forEach(([itemId, quantity]) => {
         addInventoryItem(userId, itemId, quantity);
+        recordItemStat(userId, itemId, 'harvested', quantity);
+        addWeeklyQuestProgress(userId, farm, 'harvest', itemId, quantity);
     });
-
     db.prepare(`
         UPDATE farms
         SET plots = ?,
@@ -1172,17 +1205,7 @@ function harvestReadyCrops(userId) {
             .join(', ')
     };
 }
-// 작물 이름 함수
-function getCropName(itemId) {
-    const cropNames = {
-        wheat: '밀',
-        potato: '감자',
-        carrot: '당근',
-        strawberry: '딸기'
-    };
 
-    return cropNames[itemId] || itemId;
-}
 
 ////---- 모달,버튼 관련 함수 처리하는 곳---
 async function handleFarmInteraction(interaction) {
@@ -1245,6 +1268,32 @@ async function handleFarmInteraction(interaction) {
     updateFarmTime(interaction.user.id);
     growCrops(interaction.user.id);
     //시간이 흐를때 성장함수 실행
+
+    if (interaction.customId === 'farm_weekly_quest') {
+        const farm = getFarm(interaction.user.id);
+        const quest = ensureWeeklyQuest(interaction.user.id, farm);
+
+        await interaction.reply({
+            content: createWeeklyQuestText(interaction.user.id, farm),
+            components: createWeeklyQuestRows(quest)
+        });
+
+        return true;
+    }
+
+    if (interaction.customId === 'farm_weekly_quest_claim') {
+        const farm = getFarm(interaction.user.id);
+        const result = claimWeeklyQuestReward(interaction.user.id, farm);
+
+        await interaction.update({
+            content: result.message,
+            components: []
+        });
+
+        await sendFarmPanel(interaction.channel, interaction.user);
+        return true;
+    }
+
 
     if (interaction.customId === 'farm_inventory_open') {
         await interaction.reply('인벤토리를 열었습니다.');
@@ -1467,6 +1516,13 @@ async function handleFarmInteraction(interaction) {
 
         addInventoryItem(interaction.user.id, draft.itemId, draft.quantity);
 
+        //구매를 기록함
+        recordItemStat(interaction.user.id, draft.itemId, 'bought', draft.quantity);
+        recordItemStat(interaction.user.id, draft.itemId, 'spent', totalPrice);
+        //진행도 기록
+        const farm = getFarm(interaction.user.id);
+        addWeeklyQuestProgress(interaction.user.id, farm, 'buy', draft.itemId, draft.quantity);
+
         farmUi.purchaseDrafts.delete(interaction.user.id);
 
         await interaction.update({
@@ -1573,12 +1629,22 @@ async function handleFarmInteraction(interaction) {
         const totalPrice = item.price * draft.quantity;
 
         removeInventoryItem(interaction.user.id, draft.itemId, draft.quantity);
+       
 
         db.prepare(`
             UPDATE users
             SET coins = coins + ?
             WHERE discord_user_id = ?
         `).run(totalPrice, interaction.user.id);
+
+        //판매를 기록함
+        recordItemStat(interaction.user.id, draft.itemId, 'sold', draft.quantity);
+        recordItemStat(interaction.user.id, draft.itemId, 'earned', totalPrice);
+        //진행도 기록함
+        const farm = getFarm(interaction.user.id);
+        addWeeklyQuestProgress(interaction.user.id, farm, 'sell', draft.itemId, draft.quantity);
+        addWeeklyQuestProgress(interaction.user.id, farm, 'earn', 'coin', totalPrice);
+
 
         farmUi.sellDrafts.delete(interaction.user.id);
 
