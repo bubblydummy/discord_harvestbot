@@ -1,0 +1,5 @@
+node_modules/
+config.json
+key.txt
+*.db
+.env
